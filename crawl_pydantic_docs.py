@@ -16,30 +16,177 @@ from openai import AsyncOpenAI
 import os
 from supabase import create_client, Client
 
-__location__ = os.path.dirname(os.path.abspath(__file__))
-__output__ = os.path.join(__location__, "output")
+load_dotenv()
 
-# Append parent directory to system path
-parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(parent_dir)
+open_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+supabase: Client = create_client(
+    os.getenv("SUPABASE_URL"), 
+    os.getenv("SUPABASE_SERVICE_KEY")
+)
 
-from typing import List
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
+@dataclass
+class ProcessedChunk:
+    url: str
+    chunk_number: int
+    title: str
+    summary: str
+    content: str
+    metadata: Dict[str, Any]
+    embedding: List[float]
 
-async def crawl_parallel(urls: List[str], max_concurrent: int = 3):
-    print("\n=== Parallel Crawling with Browser Reuse + Memory Check ===")
+def chunk_text(text: str, chunk_size: int = 5000) -> List[str]:
+    """
+    Split text into chunks, respecting code blocks and paragraphs.
+    """
+    chunks = []
+    start = 0
+    text_length = len(text)
 
-    # We'll keep track of peak memory usage across all tasks
-    peak_memory = 0
-    process = psutil.Process(os.getpid())
+    while start < text_length:
+        # Calculate end position
+        end = start + chunk_size
 
-    def log_memory(prefix: str = ""):
-        nonlocal peak_memory
-        current_mem = process.memory_info().rss  # in bytes
-        if current_mem > peak_memory:
-            peak_memory = current_mem
-        print(f"{prefix} Current Memory: {current_mem // (1024 * 1024)} MB, Peak: {peak_memory // (1024 * 1024)} MB")
+        # If we are at the end of a text, just take what's left
+        if end >= text_length:
+            chunks.append(text[start:].strip())
+            break
 
+        # Try to find code block boundary first (```)
+        chunk = text[start:end]
+        code_block = chunk.rfind("```")
+        if code_block != -1 and code_block > chunk_size * 0.3:
+            end = start + code_block
+        
+        # If no code block, try to break at a paragraph
+        elif '\n\n' in chunk:
+            # Find last paragraph break
+            last_break = chunk.rfind('\n\n')
+            if last_break > chunk_size * 0.3:
+                end = start + last_break
+        
+        # If no paragraph break, try to break at a sentence
+        elif '. ' in chunk:
+            # Find the last sentence break
+            last_break = chunk.rfind('. ')
+            if last_break > chunk_size * 0.3:
+                end = start + last_break + 1
+
+        chunk = chunk[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        
+        # Move the start position to the next chunk
+        start = max(start+1, end)
+
+    return chunks
+
+async def get_title_and_summary(text: str, url: str) -> Dict[str, Any]:
+    """Extract title and summary from the gpt-4o-mini model."""
+    system_prompt = """You are an AI that extracts titles and summaries from documentation chunks.
+    Return a JSON object with 'title' and 'summary' keys.
+    For the title: If this seems like the start of a document, extract its title. If it's a middle chunk, derive a descriptive title.
+    For the summary: Create a concise summary of the main points in this chunk.
+    Keep both title and summary concise but informative."""
+    
+    try:
+        response = await open_client.chat.completions.create(
+            model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"URL: {url}\n\nContent:\n{chunk[:1000]}..."}
+           ],
+           response_format={"type": "json_object"}
+        )
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        print(f"Error extracting title and summary: {e}")
+        return {"title": "Error processing title", "summary": "Error processing summary"}
+    
+async def get_embedding(text: str) -> List[float]:
+    """Get embedding for the text using the text-embedding-3-small model."""
+    try:
+        response = await open_client.embeddings.create(
+            model="text-embedding-3-small",
+            input=text
+        )
+        return response.data[0].embedding
+    except Exception as e:
+        print(f"Error getting embedding: {e}")
+        return [0] * 1536
+        
+
+async def process_chunk(chunk: str, chunk_number: int, url: str) -> ProcessedChunk:
+    """
+    Process a single chunk of the document.
+    """
+
+    # Get title and summary from the URL
+    extracted = await get_title_and_summary(chunk, url)
+
+    # Get embedding for the chunk
+    embedding = await get_embedding(chunk)
+
+    # Create metadata
+    metadata = {
+        "source": "pydantic_ai_docs",
+        "chunk_size": len(chunk),
+        "crawled_at": datetime.now(timezone.utc).isoformat(),
+        "url_path": urlparse(url).path
+    }
+
+    return ProcessedChunk(
+        url=url,
+        chunk_number=chunk_number,
+        title=extracted["title"],
+        summary=extracted["summary"],
+        content=chunk,
+        metadata=metadata,
+        embedding=embedding
+    )
+
+async def insert_chunk(chunk: ProcessedChunk):
+    """Insert a processed chunk into the Supabase."""
+    try:
+        data = {
+            "url": chunk.url,
+            "chunk_number": chunk.chunk_number,
+            "title": chunk.title,
+            "summary": chunk.summary,
+            "content": chunk.content,
+            "metadata": chunk.metadata,
+            "embedding": chunk.embedding
+        }
+
+        result = supabase.table("sites_pages").insert(data).execute()
+        print(f"Inserted chunk {chunk.chunk_number} for {chunk.url}")
+        return result
+    except Exception as e:
+        print(f"Error inserting chunk: {e}")
+        return None
+
+async def process_and_store_document(url: str, markdown: str):
+    """
+    Process and store the chunks of the document in the database.
+    """
+    # Split into chunks
+    chunks = chunk_text(markdown)
+
+    # Process each chunk in parallel
+    tasks = [
+        process_chunk(chunk, i, url)
+        for i, chunk in enumerate(chunks)
+    ]
+    processed_chunks = await asyncio.gather(*tasks)
+
+    # Store the chunks in parallel
+    insert_tasks = [
+        insert_chunk(chunk)
+        for chunk in processed_chunks
+    ]
+    await asyncio.gather(*insert_tasks)
+    
+
+async def crawl_parallel(urls: List[str], max_concurrent: int = 5):
     # Minimal browser config
     browser_config = BrowserConfig(
         headless=True,
@@ -53,50 +200,26 @@ async def crawl_parallel(urls: List[str], max_concurrent: int = 3):
     await crawler.start()
 
     try:
-        # We'll chunk the URLs in batches of 'max_concurrent'
-        success_count = 0
-        fail_count = 0
-        for i in range(0, len(urls), max_concurrent):
-            batch = urls[i : i + max_concurrent]
-            tasks = []
+        semaphore = asyncio.Semaphore(max_concurrent)
 
-            for j, url in enumerate(batch):
-                # Unique session_id per concurrent sub-task
-                session_id = f"parallel_session_{i + j}"
-                task = crawler.arun(url=url, config=crawl_config, session_id=session_id)
-                tasks.append(task)
-
-            # Check memory usage prior to launching tasks
-            log_memory(prefix=f"Before batch {i//max_concurrent + 1}: ")
-
-            # Gather results
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Check memory usage after tasks complete
-            log_memory(prefix=f"After batch {i//max_concurrent + 1}: ")
-
-            # Evaluate results
-            for url, result in zip(batch, results):
-                if isinstance(result, Exception):
-                    print(f"Error crawling {url}: {result}")
-                    fail_count += 1
-                elif result.success:
-                    success_count += 1
+        async def process_url(url: str):
+            async with semaphore:
+                result = await crawler.arun(
+                    url=url,
+                    config=crawl_config,
+                    session_id='session1',
+                )
+                if result.success:
+                    print(f"Successfully crawled {url}")
+                    await process_and_store_document(url, result.markdown_v2.raw_markdown)
                 else:
-                    fail_count += 1
-
-        print(f"\nSummary:")
-        print(f"  - Successfully crawled: {success_count}")
-        print(f"  - Failed: {fail_count}")
-
+                    print(f"Failed to crawl {url}: {result.error_message}")
+        await asyncio.gather(*[process_url(url) for url in urls])
     finally:
-        print("\nClosing crawler...")
         await crawler.close()
-        # Final memory log
-        log_memory(prefix="Final: ")
-        print(f"\nPeak memory usage (MB): {peak_memory // (1024 * 1024)}")
+                
 
-def get_pydantic_ai_docs_urls():
+def get_pydantic_ai_docs_urls() -> List[str]:
     """
     Fetches all URLs from the Pydantic AI documentation.
     Uses the sitemap (https://ai.pydantic.dev/sitemap.xml) to get these URLs.
@@ -124,11 +247,11 @@ def get_pydantic_ai_docs_urls():
 
 async def main():
     urls = get_pydantic_ai_docs_urls()
-    if urls:
-        print(f"Found {len(urls)} URLs to crawl")
-        await crawl_parallel(urls, max_concurrent=10)
-    else:
-        print("No URLs found to crawl")    
+    if not urls:
+        print("No URLs found to crawl")
+        return
+    print(f"Found {len(urls)} URLs to crawl")
+    await crawl_parallel(urls)
 
 if __name__ == "__main__":
     asyncio.run(main())
