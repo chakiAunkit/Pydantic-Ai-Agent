@@ -234,4 +234,4 @@ todo/
 
 # windsurf rules
 .windsurfrules
-.private
+.private".env" 
